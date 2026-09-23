@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import csv
 import io
-import json
 from collections import Counter
 from typing import Any
 

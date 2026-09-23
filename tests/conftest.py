@@ -7,7 +7,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 try:
-    import mcp  # noqa: F401
+    import mcp
 except ModuleNotFoundError:
     mcp = types.ModuleType("mcp")
     server_mod = types.ModuleType("mcp.server")

@@ -1,5 +1,6 @@
 import pytest
 
+from borealis_toolkit.config import Settings
 from borealis_toolkit.errors import BorealisUnsupportedFileError
 from borealis_toolkit.service import BorealisService
 
@@ -165,3 +166,103 @@ async def test_assess_metadata_quality_handles_sparse_metadata():
     assert result.data["grade"] == "F"
     assert result.data["missing_fields"]
     assert all(r["field"] in result.data["missing_fields"] for r in result.data["recommendations"])
+
+
+class FakeFilesClient:
+    async def request_json(self, method, endpoint, *, params=None, accept=None):
+        assert endpoint == "datasets/:persistentId/versions/:latest-published/files"
+        return {
+            "data": [
+                {
+                    "description": "Survey responses",
+                    "restricted": False,
+                    "dataFile": {
+                        "id": 42,
+                        "filename": "responses.tab",
+                        "friendlyType": "Tab-Delimited",
+                        "contentType": "text/tab-separated-values",
+                        "filesize": 2048,
+                        "tabularData": True,
+                        "md5": "abc123",
+                    },
+                },
+                {
+                    "description": "Codebook",
+                    "restricted": True,
+                    "dataFile": {
+                        "id": 43,
+                        "filename": "codebook.pdf",
+                        "friendlyType": "PDF",
+                        "contentType": "application/pdf",
+                        "filesize": 500,
+                        "tabularData": False,
+                    },
+                },
+            ],
+            "totalCount": 2,
+        }, False
+
+
+async def test_list_dataset_files_returns_structured_entries():
+    service = BorealisService(client=FakeFilesClient())
+    result = await service.list_dataset_files("doi:10.5683/SP3/EXAMPLE")
+    assert result.data["total_files"] == 2
+    assert result.data["returned"] == 2
+    responses = result.data["files"][0]
+    assert responses["file_id"] == 42
+    assert responses["download_url"] == "https://borealisdata.ca/api/access/datafile/42"
+    assert responses["size_display"] == "2.0 KB"
+    assert result.data["files"][1]["restricted"] is True
+
+
+async def test_list_dataset_files_filters_by_file_type():
+    service = BorealisService(client=FakeFilesClient())
+    result = await service.list_dataset_files("doi:10.5683/SP3/EXAMPLE", file_type="pdf")
+    assert result.data["returned"] == 1
+    assert result.data["files"][0]["filename"] == "codebook.pdf"
+
+
+class FakeDownloadClient:
+    def __init__(self, raw: bytes, content_type="text/plain"):
+        self.raw = raw
+        self.content_type = content_type
+
+    async def download_limited(self, file_id):
+        return self.raw, self.content_type, False
+
+
+async def test_get_dataset_file_returns_requested_line_range():
+    text = "\n".join(f"line {i}" for i in range(1, 11)).encode()
+    service = BorealisService(client=FakeDownloadClient(text))
+    result = await service.get_dataset_file("1", filename="notes.txt", start_line=3, max_lines=2)
+    assert result.data["content"] == "line 3\nline 4"
+    assert result.data["start_line"] == 3
+    assert result.data["end_line"] == 4
+    assert result.data["truncated"] is True
+
+
+async def test_get_dataset_file_rejects_unsupported_extension():
+    service = BorealisService(client=FakeDownloadClient(b"binary"))
+    with pytest.raises(BorealisUnsupportedFileError):
+        await service.get_dataset_file("1", filename="archive.zip")
+
+
+async def test_get_dataset_file_falls_back_to_latin1_on_bad_utf8():
+    raw = "café".encode("latin-1")
+    service = BorealisService(client=FakeDownloadClient(raw))
+    result = await service.get_dataset_file("1", filename="notes.txt")
+    assert result.data["encoding"] == "latin-1"
+
+
+def test_server_status_reports_settings_and_capabilities():
+    settings = Settings(api_base_url="https://example.test/api", api_key="a-fairly-long-fake-key")
+
+    class FakeClientWithSettings:
+        def __init__(self):
+            self.settings = settings
+
+    service = BorealisService(client=FakeClientWithSettings())
+    result = service.server_status()
+    assert result.data["api_base_url"] == "https://example.test/api"
+    assert result.data["authentication_configured"] is True
+    assert "search" in result.data["capabilities"]
