@@ -103,22 +103,36 @@ async def get_variable_metadata(
     file_id: str,
     include_summary_stats: bool = True,
     max_variables: int = 50,
+    offset: int = 0,
+    name_filter: str | None = None,
 ) -> dict:
     """Retrieve DDI variable-level metadata for a tabular file in Borealis.
 
     Returns variable names, labels, value labels, question text, universe,
-    data type, and optionally summary statistics for each variable. This is
+    data type, interval (discrete/contin), notes, weight flag, variable
+    groups, and optionally summary statistics for each variable. This is
     the richest DDI content in Dataverse and is not covered by
     get_dataset_metadata, which only returns dataset-level fields. Useful for
     understanding what a dataset measures before downloading it.
+
+    Large surveys can have 1,000+ variables: use name_filter to find the
+    ones you need, or page through them with offset.
 
     Args:
         file_id: The Dataverse file ID (integer, found in list_dataset_files output).
         include_summary_stats: If True, include min/max/mean/freq counts per variable.
         max_variables: Maximum number of variables to return (default 50, max 500).
+        offset: Number of matching variables to skip, for paging (default 0).
+        name_filter: Case-insensitive text matched against variable names and labels (e.g. "income").
     """
     try:
-        return (await service.get_variable_metadata(file_id, include_summary_stats=include_summary_stats, max_variables=max_variables)).to_dict()
+        return (await service.get_variable_metadata(
+            file_id,
+            include_summary_stats=include_summary_stats,
+            max_variables=max_variables,
+            offset=offset,
+            name_filter=name_filter,
+        )).to_dict()
     except (BorealisError, ValueError) as exc:
         return {"error": "Could not retrieve variable metadata.", "details": str(exc)}
 
@@ -127,7 +141,8 @@ async def get_variable_metadata(
 async def assess_metadata_quality(
     persistent_id: str,
     include_variable_check: bool = False,
-    version: str = ":latest",
+    version: str = ":latest-published",
+    max_files_checked: int = 5,
 ) -> dict:
     """Assess the DDI metadata completeness and quality of a Borealis dataset.
 
@@ -139,12 +154,21 @@ async def assess_metadata_quality(
 
     Args:
         persistent_id: Dataset DOI or handle (e.g. "doi:10.5683/SP3/ABCDEF").
-        include_variable_check: If True, also check variable-level DDI metadata
-                                (slower — makes extra API calls).
-        version: Dataset version to check when include_variable_check is True (default ":latest").
+        include_variable_check: If True, also score variable-level DDI documentation
+                                across the dataset's tabular files (slower — makes
+                                extra API calls). Partial credit is given for the share
+                                of variables with labels, value labels (categorical
+                                variables only) and question text.
+        version: Dataset version to assess, e.g. ":latest-published" (default), ":latest", or "2.0".
+        max_files_checked: Maximum tabular files inspected by the variable check (default 5, max 20).
     """
     try:
-        return (await service.assess_metadata_quality(persistent_id, include_variable_check=include_variable_check, version=version)).to_dict()
+        return (await service.assess_metadata_quality(
+            persistent_id,
+            include_variable_check=include_variable_check,
+            version=version,
+            max_files_checked=max_files_checked,
+        )).to_dict()
     except (BorealisError, ValueError) as exc:
         return {"error": "Could not assess metadata quality.", "details": str(exc)}
 

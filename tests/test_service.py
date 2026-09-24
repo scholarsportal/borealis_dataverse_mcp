@@ -59,11 +59,14 @@ _SAMPLE_DDI_XML = """<?xml version='1.0' encoding='UTF-8'?>
 
 
 class FakeDdiClient:
+    settings = Settings()
+
     def __init__(self, xml_text=_SAMPLE_DDI_XML):
         self.xml_text = xml_text
 
-    async def request_text(self, method, endpoint, *, params=None, accept=None):
+    async def request_text(self, method, endpoint, *, params=None, accept=None, max_bytes=None):
         assert endpoint == "access/datafile/12345/metadata/ddi"
+        assert max_bytes == self.settings.max_ddi_bytes
         return self.xml_text, False
 
 
@@ -95,8 +98,36 @@ async def test_get_variable_metadata_respects_max_variables():
     assert result.warnings
 
 
+async def test_get_variable_metadata_pages_with_offset_and_filter():
+    service = BorealisService(client=FakeDdiClient())
+    result = await service.get_variable_metadata("12345", max_variables=1, offset=1)
+    assert [v["name"] for v in result.data["variables"]] == ["REGION"]
+    assert result.data["offset"] == 1
+    assert result.data["returned"] == 1
+    assert not result.warnings
+
+    result = await service.get_variable_metadata("12345", name_filter="old")
+    assert result.data["matched_count"] == 0
+    assert "No variables matched" in result.warnings[0]
+
+
+async def test_get_variable_metadata_tells_caller_the_next_offset():
+    service = BorealisService(client=FakeDdiClient())
+    result = await service.get_variable_metadata("12345", max_variables=1)
+    assert "offset=1" in result.warnings[0]
+
+
+@pytest.mark.parametrize("bad_id", ["../datasets/1", "abc", "", "12 34"])
+async def test_get_variable_metadata_rejects_non_numeric_file_ids(bad_id):
+    service = BorealisService(client=FakeDdiClient())
+    with pytest.raises(ValueError, match="numeric"):
+        await service.get_variable_metadata(bad_id)
+
+
 class FakeUnsupportedFileClient:
-    async def request_text(self, method, endpoint, *, params=None, accept=None):
+    settings = Settings()
+
+    async def request_text(self, method, endpoint, *, params=None, accept=None, max_bytes=None):
         raise BorealisUnsupportedFileError("Borealis rejected the request: not a tabular file")
 
 
@@ -135,7 +166,7 @@ class FakeQualityClient:
         self.metadata = metadata
 
     async def request_json(self, method, endpoint, *, params=None, accept=None):
-        assert endpoint == "datasets/:persistentId/metadata"
+        assert endpoint == "datasets/:persistentId/versions/:latest-published/metadata"
         return self.metadata, False
 
 
@@ -167,6 +198,77 @@ async def test_assess_metadata_quality_handles_sparse_metadata():
     assert result.data["missing_fields"]
     assert all(r["field"] in result.data["missing_fields"] for r in result.data["recommendations"])
 
+
+
+class FakeVariableCheckClient:
+    """Dataset with three tabular files: one documented, one bare, one whose DDI errors."""
+
+    settings = Settings()
+
+    def __init__(self):
+        self.ddi_requests = []
+
+    async def request_json(self, method, endpoint, *, params=None, accept=None):
+        if endpoint.endswith("/metadata"):
+            assert endpoint == "datasets/:persistentId/versions/1.0/metadata"
+            return _SAMPLE_DATASET_METADATA, False
+        assert endpoint == "datasets/:persistentId/versions/1.0/files"
+        files = [
+            {"dataFile": {"id": 1, "filename": "good.tab", "tabularData": True}},
+            {"dataFile": {"id": 2, "filename": "bare.tab", "tabularData": True}},
+            {"dataFile": {"id": 3, "filename": "broken.tab", "tabularData": True}},
+            {"dataFile": {"id": 4, "filename": "codebook.pdf", "tabularData": False}},
+        ]
+        return {"data": files, "totalCount": len(files)}, False
+
+    async def request_text(self, method, endpoint, *, params=None, accept=None, max_bytes=None):
+        self.ddi_requests.append(endpoint)
+        if endpoint.startswith("access/datafile/3/"):
+            raise BorealisUnsupportedFileError("boom")
+        if endpoint.startswith("access/datafile/2/"):
+            return _BARE_DDI_XML, False
+        return _SAMPLE_DDI_XML, False
+
+
+_BARE_DDI_XML = """<?xml version='1.0' encoding='UTF-8'?>
+<codeBook xmlns="ddi:codebook:2_5">
+  <dataDscr>
+    <var ID="b1" name="X1"><varFormat type="numeric"/></var>
+    <var ID="b2" name="X2"><varFormat type="numeric"/></var>
+  </dataDscr>
+</codeBook>
+"""
+
+
+async def test_assess_metadata_quality_pools_variable_coverage_across_tabular_files():
+    client = FakeVariableCheckClient()
+    service = BorealisService(client=client)
+    result = await service.assess_metadata_quality("doi:10.5683/SP3/MMXTFC", include_variable_check=True, version="1.0")
+    data = result.data
+    check = data["variable_check"]
+
+    assert check["files_total_tabular"] == 3
+    assert check["files_checked"] == 2
+    assert [f["filename"] for f in check["per_file"]] == ["good.tab", "bare.tab"]
+    # good.tab: 2 labelled, 1 categorical w/ labels, 1 question; bare.tab: nothing.
+    assert check["coverage"] == {"variables": 4, "labelled": 2, "categorical": 1, "value_labelled": 1, "with_question_text": 1}
+    assert check["points"] == 5 * 0.5 + 3 * 1.0 + 2 * 0.25
+    assert data["variable_metadata_present"] is True
+    assert "variable_metadata" in data["missing_fields"]
+    assert any("broken.tab" in w for w in result.warnings)
+    assert any("2 of 4 variables lack a label" in r["message"] for r in data["recommendations"])
+    assert result.provenance.endpoint == "GET /api/datasets/:persistentId/versions/1.0/metadata"
+
+
+async def test_assess_metadata_quality_caps_files_checked():
+    client = FakeVariableCheckClient()
+    service = BorealisService(client=client)
+    result = await service.assess_metadata_quality(
+        "doi:10.5683/SP3/MMXTFC", include_variable_check=True, version="1.0", max_files_checked=1
+    )
+    assert result.data["variable_check"]["files_checked"] == 1
+    assert len(client.ddi_requests) == 1
+    assert any("max_files_checked" in w for w in result.warnings)
 
 class FakeFilesClient:
     async def request_json(self, method, endpoint, *, params=None, accept=None):

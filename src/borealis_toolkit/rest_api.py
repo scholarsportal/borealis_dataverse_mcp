@@ -73,16 +73,38 @@ async def file_profile(file_id: str, filename: str = "table.csv", delimiter: str
 
 
 @app.get("/v1/files/{file_id}/variables")
-async def file_variables(file_id: str, include_summary_stats: bool = True, max_variables: int = 50) -> dict:
+async def file_variables(
+    file_id: str,
+    include_summary_stats: bool = True,
+    max_variables: int = 50,
+    offset: int = 0,
+    name_filter: str | None = None,
+) -> dict:
     try:
-        return (await service.get_variable_metadata(file_id, include_summary_stats=include_summary_stats, max_variables=max_variables)).to_dict()
+        return (await service.get_variable_metadata(
+            file_id,
+            include_summary_stats=include_summary_stats,
+            max_variables=max_variables,
+            offset=offset,
+            name_filter=name_filter,
+        )).to_dict()
     except (BorealisError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.get("/v1/datasets/quality")
-async def dataset_quality(identifier: str, include_variable_check: bool = False, version: str = ":latest") -> dict:
+async def dataset_quality(
+    identifier: str,
+    include_variable_check: bool = False,
+    version: str = ":latest-published",
+    max_files_checked: int = 5,
+) -> dict:
     try:
-        return (await service.assess_metadata_quality(identifier, include_variable_check=include_variable_check, version=version)).to_dict()
+        return (await service.assess_metadata_quality(
+            identifier,
+            include_variable_check=include_variable_check,
+            version=version,
+            max_files_checked=max_files_checked,
+        )).to_dict()
     except (BorealisError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

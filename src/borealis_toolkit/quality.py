@@ -3,11 +3,12 @@ from __future__ import annotations
 from typing import Any
 
 # Each spec scores one DDI-relevant field out of a Dataverse dataset's exported
-# metadata. `match` substrings are checked against metadata's top-level keys
-# (case-insensitively) rather than one fixed key name, because different
-# Dataverse installs prefix fields with different metadata-block namespaces
-# (e.g. 'citation:', 'socialscience:', 'geospatial:') depending on which
-# blocks they enable.
+# metadata. Different Dataverse installs prefix fields with different
+# metadata-block namespaces (e.g. 'citation:', 'socialscience:', 'geospatial:')
+# depending on which blocks they enable, so `match` names are compared against
+# each top-level key's local name (after the last ':'), case-insensitively.
+# An exact local-name match wins; a substring match is only the fallback, so
+# 'title' finds 'title' rather than 'alternativeTitle' or 'seriesTitle'.
 _FIELD_SPECS: list[dict[str, Any]] = [
     {"key": "title", "weight": 5, "category": "discovery", "match": ["title"]},
     {"key": "author", "weight": 5, "category": "discovery", "match": ["author"]},
@@ -28,6 +29,9 @@ _FIELD_SPECS: list[dict[str, Any]] = [
 VARIABLE_METADATA_WEIGHT = 10
 VARIABLE_METADATA_CATEGORY = "access"
 
+# Share of VARIABLE_METADATA_WEIGHT earned by each kind of variable-level documentation.
+_VARIABLE_COVERAGE_WEIGHTS = {"labels": 5, "value_labels": 3, "question_text": 2}
+
 _RECOMMENDATIONS: dict[str, str] = {
     "title": "Add a descriptive title. It is the primary field used for discovery and citation.",
     "author": "Add at least one author with name and affiliation.",
@@ -44,6 +48,9 @@ _RECOMMENDATIONS: dict[str, str] = {
     "license": "Add a license (e.g. CC-BY) so reusers know their rights.",
     "file_format_documented": "Note the original file format(s) contributed (e.g. SPSS, Stata), not just the archival .tab conversion.",
     "variable_metadata": "Add variable-level DDI documentation (labels, value labels, question text) — the richest reuse signal in a dataset.",
+    "variable_labels": "{missing} of {total} variables lack a label. Variable labels are the minimum reusers need to know what each column measures.",
+    "variable_value_labels": "{missing} of {total} categorical variables lack value labels, so their codes cannot be interpreted without the codebook.",
+    "variable_question_text": "{missing} of {total} variables lack question text. Adding the literal question wording helps reusers compare across surveys.",
 }
 
 _PRIORITY_ORDER = {"high": 0, "medium": 1, "low": 2}
@@ -77,8 +84,49 @@ def _count_entries(value: Any) -> int:
     return 0 if value in (None, "", {}) else 1
 
 
-def recommendation_for(field_key: str) -> str:
-    return _RECOMMENDATIONS[field_key]
+def recommendation_for(field_key: str, **values: Any) -> str:
+    message = _RECOMMENDATIONS[field_key]
+    return message.format(**values) if values else message
+
+
+def _find_key(keys: list[str], names: list[str]) -> str | None:
+    local = {key: key.rsplit(":", 1)[-1].lower() for key in keys}
+    for key in keys:
+        if local[key] in names:
+            return key
+    return next((key for key in keys if any(name in local[key] for name in names)), None)
+
+
+def score_variable_coverage(coverage: dict[str, int]) -> tuple[float, list[dict[str, str]]]:
+    """Partial credit out of VARIABLE_METADATA_WEIGHT for variable-level documentation.
+
+    Labels, value labels (among categorical variables only) and question text
+    each earn their share in proportion to how many variables carry them. A
+    component with nothing to measure (e.g. no categorical variables) earns
+    full credit rather than penalizing the dataset.
+    Returns (points, recommendations for the incomplete components).
+    """
+    total = coverage.get("variables", 0)
+    if total == 0:
+        return 0.0, [{"priority": "high", "field": "variable_metadata", "message": recommendation_for("variable_metadata")}]
+
+    components = [
+        ("labels", "variable_labels", coverage.get("labelled", 0), total, "high"),
+        ("value_labels", "variable_value_labels", coverage.get("value_labelled", 0), coverage.get("categorical", 0), "medium"),
+        ("question_text", "variable_question_text", coverage.get("with_question_text", 0), total, "low"),
+    ]
+    points = 0.0
+    recommendations: list[dict[str, str]] = []
+    for component, rec_key, have, denominator, priority in components:
+        ratio = have / denominator if denominator else 1.0
+        points += _VARIABLE_COVERAGE_WEIGHTS[component] * ratio
+        if ratio < 1.0:
+            recommendations.append({
+                "priority": priority,
+                "field": "variable_metadata",
+                "message": recommendation_for(rec_key, missing=denominator - have, total=denominator),
+            })
+    return round(points, 1), recommendations
 
 
 def sort_recommendations(recommendations: list[dict[str, str]]) -> list[dict[str, str]]:
@@ -91,7 +139,7 @@ def assess_dataverse_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
     so nested parent-collection metadata (schema:isPartOf, @context, ...)
     never gets mistaken for the dataset's own fields.
     """
-    keys_lower = {key.lower(): key for key in metadata}
+    keys = list(metadata)
     breakdown: dict[str, dict[str, Any]] = {}
     present: list[str] = []
     missing: list[str] = []
@@ -105,7 +153,7 @@ def assess_dataverse_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
         category["fields"].append(spec["key"])
         max_total += spec["weight"]
 
-        matched_key = next((keys_lower[k] for k in keys_lower if any(sub in k for sub in spec["match"])), None)
+        matched_key = _find_key(keys, spec["match"])
         value = metadata.get(matched_key) if matched_key else None
         present_ok = matched_key is not None and value not in (None, "", [], {})
         if present_ok and "min_length" in spec:

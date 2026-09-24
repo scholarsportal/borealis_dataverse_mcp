@@ -205,10 +205,10 @@ Returns a bounded line range from a text, `.docx`, or `.pdf` file. PDF text extr
 Profiles CSV or TSV content. Results include a warning against interpreting row counts as entity counts without documentation.
 
 ### `get_variable_metadata`
-Parses a tabular file's DDI codebook and returns per-variable labels, value labels, question text, universe, data type, and optionally summary statistics. This is the richest DDI content Dataverse exposes and is not covered by `get_dataset_metadata`.
+Parses a tabular file's DDI codebook and returns per-variable labels, value labels, question text, universe, data type, interval (discrete/continuous), notes, weight flag, variable groups, and optionally summary statistics. This is the richest DDI content Dataverse exposes and is not covered by `get_dataset_metadata`. Large surveys often have 1,000+ variables, so `name_filter` matches variable names and labels (e.g. `income`) and `offset` pages through results. The codebook download is capped by `BOREALIS_MAX_DDI_BYTES` (default 25 MB), and XML containing DOCTYPE/ENTITY declarations is refused.
 
 ### `assess_metadata_quality`
-Scores a dataset's DDI metadata completeness against a 15-field, DDI-informed rubric (0-100, letter grade), grouped into discovery/coverage/methodology/access categories, with prioritized recommendations for missing fields. Pass `include_variable_check=True` to also factor in whether the dataset's tabular files carry variable-level documentation. Works against any public Dataverse installation.
+Scores a dataset's DDI metadata completeness against a 15-field, DDI-informed rubric (0-100, letter grade), grouped into discovery/coverage/methodology/access categories, with prioritized recommendations for missing fields. Pass `include_variable_check=True` to also score variable-level documentation, pooled across the dataset's tabular files (up to `max_files_checked`, default 5). This earns partial credit out of 10 points: 5 for the share of variables with labels, 3 for value labels on categorical variables, and 2 for question text. The rubric scores the requested `version` (default `:latest-published`). Works against any public Dataverse installation.
 
 ### `get_server_status`
 Returns toolkit version, API target, configured limits, authentication state, and available capabilities.

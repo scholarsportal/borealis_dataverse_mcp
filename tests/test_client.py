@@ -96,3 +96,35 @@ async def test_download_limited_raises_when_over_max_bytes():
     client = make_client(max_file_bytes=10)
     with pytest.raises(BorealisFileTooLargeError):
         await client.download_limited("1")
+
+
+@respx.mock
+async def test_request_text_returns_body_under_max_bytes():
+    respx.get("https://example.test/api/access/datafile/1/metadata/ddi").mock(
+        return_value=httpx.Response(200, text="<codeBook/>")
+    )
+    client = make_client()
+    text, used_auth = await client.request_text("GET", "access/datafile/1/metadata/ddi", max_bytes=100)
+    assert text == "<codeBook/>"
+    assert used_auth is False
+
+
+@respx.mock
+async def test_request_text_raises_when_over_max_bytes():
+    respx.get("https://example.test/api/access/datafile/1/metadata/ddi").mock(
+        return_value=httpx.Response(200, content=b"x" * 100)
+    )
+    client = make_client()
+    with pytest.raises(BorealisFileTooLargeError):
+        await client.request_text("GET", "access/datafile/1/metadata/ddi", max_bytes=10)
+
+
+@respx.mock
+async def test_request_text_retries_without_auth_after_401():
+    route = respx.get("https://example.test/api/access/datafile/1/metadata/ddi")
+    route.side_effect = [httpx.Response(401), httpx.Response(200, text="<codeBook/>")]
+    client = make_client(api_key="a-fairly-long-fake-key")
+    text, used_auth = await client.request_text("GET", "access/datafile/1/metadata/ddi")
+    assert text == "<codeBook/>"
+    assert used_auth is False
+    assert route.call_count == 2

@@ -6,15 +6,16 @@ from collections import Counter
 from typing import Any
 
 from .client import BorealisClient
-from .ddi import parse_ddi_variables
+from .ddi import documentation_coverage, parse_ddi_variables
 from .errors import BorealisError, BorealisUnsupportedFileError
 from .institutions import normalize_institution
 from .models import Provenance, ToolkitResult
 from .quality import (
+    VARIABLE_METADATA_CATEGORY,
     VARIABLE_METADATA_WEIGHT,
     assess_dataverse_metadata,
     grade_for_score,
-    recommendation_for,
+    score_variable_coverage,
     sort_recommendations,
 )
 from .utils import human_size, normalize_boolean_query, normalize_identifier, utc_now_iso
@@ -100,13 +101,14 @@ class BorealisService:
         }
         return ToolkitResult(data, Provenance("GET /api/search", utc_now_iso(), used_auth, dict(params)))
 
-    async def get_dataset_metadata(self, identifier: str) -> ToolkitResult:
+    async def get_dataset_metadata(self, identifier: str, *, version: str | None = None) -> ToolkitResult:
         normalized, persistent = normalize_identifier(identifier)
+        version_path = f"versions/{version}/" if version else ""
         if persistent:
-            endpoint = "datasets/:persistentId/metadata"
+            endpoint = f"datasets/:persistentId/{version_path}metadata"
             params = {"persistentId": normalized}
         else:
-            endpoint = f"datasets/{normalized}/metadata"
+            endpoint = f"datasets/{normalized}/{version_path}metadata"
             params = None
         payload, used_auth = await self.client.request_json("GET", endpoint, params=params, accept="application/ld+json")
         metadata = payload.get("data", payload)
@@ -282,33 +284,71 @@ class BorealisService:
             warnings,
         )
 
+    async def _fetch_ddi(self, file_id: str) -> tuple[str, str, bool]:
+        file_id = str(file_id).strip()
+        if not file_id.isdigit():
+            raise ValueError("file_id must be a numeric Dataverse file ID (see list_dataset_files).")
+        endpoint = f"access/datafile/{file_id}/metadata/ddi"
+        try:
+            # The DDI endpoint 406s on an explicit XML Accept header; it only serves
+            # XML on its default content negotiation, so no accept header is sent.
+            xml_text, used_auth = await self.client.request_text(
+                "GET", endpoint, max_bytes=self.client.settings.max_ddi_bytes
+            )
+        except BorealisUnsupportedFileError as exc:
+            raise BorealisUnsupportedFileError(
+                f"File {file_id} has no DDI variable metadata. It may not be a tabular (ingested) file."
+            ) from exc
+        return xml_text, endpoint, used_auth
+
     async def get_variable_metadata(
         self,
         file_id: str,
         *,
         include_summary_stats: bool = True,
         max_variables: int = 50,
+        offset: int = 0,
+        name_filter: str | None = None,
     ) -> ToolkitResult:
         max_variables = max(1, min(int(max_variables), 500))
-        endpoint = f"access/datafile/{file_id}/metadata/ddi"
-        try:
-            # The DDI endpoint 406s on an explicit XML Accept header; it only serves
-            # XML on its default content negotiation, so no accept header is sent.
-            xml_text, used_auth = await self.client.request_text("GET", endpoint)
-        except BorealisUnsupportedFileError as exc:
-            raise BorealisUnsupportedFileError(
-                f"File {file_id} has no DDI variable metadata. It may not be a tabular (ingested) file."
-            ) from exc
+        offset = max(0, int(offset))
+        name_filter = (name_filter or "").strip() or None
+        xml_text, endpoint, used_auth = await self._fetch_ddi(file_id)
 
-        variables, total = parse_ddi_variables(xml_text, include_summary_stats=include_summary_stats, max_variables=max_variables)
+        variables, matched, total = parse_ddi_variables(
+            xml_text,
+            include_summary_stats=include_summary_stats,
+            max_variables=max_variables,
+            offset=offset,
+            name_filter=name_filter,
+        )
         warnings: list[str] = []
         if total == 0:
             warnings.append(f"File {file_id} has no DDI variables (0 found).")
-        elif total > len(variables):
-            warnings.append(f"Returned {len(variables)} of {total} variables; raise max_variables to see the rest.")
+        elif matched == 0:
+            warnings.append(f"No variables matched name_filter={name_filter!r} (out of {total}).")
+        elif offset >= matched:
+            warnings.append(f"offset={offset} is past the last matching variable ({matched} matched).")
+        elif offset + len(variables) < matched:
+            warnings.append(
+                f"Returned variables {offset + 1}-{offset + len(variables)} of {matched}; "
+                f"call again with offset={offset + len(variables)} to see more."
+            )
         return ToolkitResult(
-            {"file_id": str(file_id), "variable_count": total, "variables": variables},
-            Provenance(f"GET /api/{endpoint}", utc_now_iso(), used_auth, {"include_summary_stats": include_summary_stats, "max_variables": max_variables}),
+            {
+                "file_id": str(file_id).strip(),
+                "variable_count": total,
+                "matched_count": matched,
+                "offset": offset,
+                "returned": len(variables),
+                "variables": variables,
+            },
+            Provenance(
+                f"GET /api/{endpoint}",
+                utc_now_iso(),
+                used_auth,
+                {"include_summary_stats": include_summary_stats, "max_variables": max_variables, "offset": offset, "name_filter": name_filter},
+            ),
             warnings,
         )
 
@@ -317,51 +357,44 @@ class BorealisService:
         persistent_id: str,
         *,
         include_variable_check: bool = False,
-        version: str = ":latest",
+        version: str = ":latest-published",
+        max_files_checked: int = 5,
     ) -> ToolkitResult:
-        metadata_result = await self.get_dataset_metadata(persistent_id)
+        max_files_checked = max(1, min(int(max_files_checked), 20))
+        metadata_result = await self.get_dataset_metadata(persistent_id, version=version)
         metadata = metadata_result.data
         used_auth = metadata_result.provenance.authenticated
 
         assessment = assess_dataverse_metadata(metadata)
         breakdown = assessment["breakdown"]
-        present_fields = assessment["present_fields"]
-        missing_fields = assessment["missing_fields"]
-        recommendations = assessment["recommendations"]
-        earned = assessment["earned"]
+        present_fields = list(assessment["present_fields"])
+        missing_fields = list(assessment["missing_fields"])
+        recommendations = list(assessment["recommendations"])
+        earned: float = assessment["earned"]
         max_total = assessment["max_total"]
 
         warnings: list[str] = []
         variable_metadata_present: bool | None = None
+        variable_check: dict[str, Any] | None = None
         if include_variable_check:
-            access = breakdown.setdefault("access", {"score": 0, "max": 0, "fields": []})
-            access["max"] += VARIABLE_METADATA_WEIGHT
-            access["fields"].append("variable_metadata")
+            category = breakdown.setdefault(VARIABLE_METADATA_CATEGORY, {"score": 0, "max": 0, "fields": []})
+            category["max"] += VARIABLE_METADATA_WEIGHT
+            category["fields"].append("variable_metadata")
             max_total += VARIABLE_METADATA_WEIGHT
-            variable_metadata_present = False
-            try:
-                files_result = await self.list_dataset_files(persistent_id, limit=200, version=version)
-                tabular_file = next((f for f in files_result.data["files"] if f.get("tabular")), None)
-                if tabular_file is not None:
-                    var_result = await self.get_variable_metadata(tabular_file["file_id"])
-                    variable_metadata_present = any(v.get("label") for v in var_result.data["variables"])
-                else:
-                    warnings.append("No tabular file was found in this dataset version; variable-level check could not run.")
-            except BorealisError as exc:
-                warnings.append(f"Variable-level metadata check failed: {exc}")
+            variable_check, check_warnings = await self._check_variable_metadata(persistent_id, version, max_files_checked)
+            warnings.extend(check_warnings)
 
-            if variable_metadata_present:
-                access["score"] += VARIABLE_METADATA_WEIGHT
-                earned += VARIABLE_METADATA_WEIGHT
+            coverage = variable_check["coverage"]
+            points, variable_recommendations = score_variable_coverage(coverage)
+            variable_check["points"] = points
+            variable_metadata_present = coverage["labelled"] > 0
+            category["score"] += points
+            earned += points
+            if points >= VARIABLE_METADATA_WEIGHT:
                 present_fields.append("variable_metadata")
             else:
                 missing_fields.append("variable_metadata")
-                recommendations.append({
-                    "priority": "high",
-                    "field": "variable_metadata",
-                    "message": recommendation_for("variable_metadata"),
-                })
-            recommendations = sort_recommendations(recommendations)
+            recommendations = sort_recommendations(recommendations + variable_recommendations)
 
         score = round(earned / max_total * 100) if max_total else 0
         data = {
@@ -375,12 +408,58 @@ class BorealisService:
             "present_fields": present_fields,
             "recommendations": recommendations,
             "variable_metadata_present": variable_metadata_present,
+            "variable_check": variable_check,
         }
         return ToolkitResult(
             data,
-            Provenance("GET /api/datasets/:persistentId/metadata", utc_now_iso(), used_auth, {"include_variable_check": include_variable_check, "version": version}),
+            Provenance(
+                metadata_result.provenance.endpoint,
+                utc_now_iso(),
+                used_auth,
+                {"include_variable_check": include_variable_check, "version": version, "max_files_checked": max_files_checked},
+            ),
             warnings,
         )
+
+    async def _check_variable_metadata(
+        self, persistent_id: str, version: str, max_files_checked: int
+    ) -> tuple[dict[str, Any], list[str]]:
+        """Pool variable-level documentation coverage across a dataset's tabular files."""
+        warnings: list[str] = []
+        per_file: list[dict[str, Any]] = []
+        pooled = documentation_coverage([])
+        tabular_files: list[dict[str, Any]] = []
+        try:
+            files_result = await self.list_dataset_files(persistent_id, limit=1000, version=version)
+            tabular_files = [f for f in files_result.data["files"] if f.get("tabular")]
+        except BorealisError as exc:
+            warnings.append(f"Variable-level metadata check could not list files: {exc}")
+
+        if not tabular_files and not warnings:
+            warnings.append("No tabular file was found in this dataset version; variable-level check could not run.")
+        if len(tabular_files) > max_files_checked:
+            warnings.append(f"Checked {max_files_checked} of {len(tabular_files)} tabular files; raise max_files_checked to check more.")
+
+        for tabular_file in tabular_files[:max_files_checked]:
+            file_id = str(tabular_file["file_id"])
+            try:
+                xml_text, _endpoint, _used_auth = await self._fetch_ddi(file_id)
+                # Every variable counts toward coverage, so no max_variables cap here.
+                variables, _matched, _total = parse_ddi_variables(xml_text, include_summary_stats=False, max_variables=None)
+            except (BorealisError, ValueError) as exc:
+                warnings.append(f"Variable-level check skipped file {file_id} ({tabular_file.get('filename')}): {exc}")
+                continue
+            coverage = documentation_coverage(variables)
+            per_file.append({"file_id": file_id, "filename": tabular_file.get("filename"), **coverage})
+            for key, value in coverage.items():
+                pooled[key] += value
+
+        return {
+            "files_total_tabular": len(tabular_files),
+            "files_checked": len(per_file),
+            "coverage": pooled,
+            "per_file": per_file,
+        }, warnings
 
     def server_status(self) -> ToolkitResult:
         settings = self.client.settings

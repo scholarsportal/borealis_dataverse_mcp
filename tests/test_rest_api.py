@@ -10,6 +10,7 @@ class StubService:
     def __init__(self, *, result=None, error=None):
         self._result = result
         self._error = error
+        self.calls = []
 
     def _resolve(self):
         if self._error is not None:
@@ -32,9 +33,11 @@ class StubService:
         return self._resolve()
 
     async def get_variable_metadata(self, *args, **kwargs):
+        self.calls.append(("get_variable_metadata", args, kwargs))
         return self._resolve()
 
     async def assess_metadata_quality(self, *args, **kwargs):
+        self.calls.append(("assess_metadata_quality", args, kwargs))
         return self._resolve()
 
     def server_status(self):
@@ -89,3 +92,21 @@ def test_dataset_quality_returns_200(client, monkeypatch):
     response = client.get("/v1/datasets/quality", params={"identifier": "doi:10.5683/SP3/EXAMPLE"})
     assert response.status_code == 200
     assert response.json()["data"]["grade"] == "B"
+
+
+def test_file_variables_forwards_paging_and_filter(client, monkeypatch):
+    stub = StubService(result=_ok_result({"variables": []}))
+    monkeypatch.setattr(rest_api, "service", stub)
+    response = client.get("/v1/files/12345/variables", params={"offset": 50, "name_filter": "income", "max_variables": 10})
+    assert response.status_code == 200
+    name, args, kwargs = stub.calls[0]
+    assert (name, args) == ("get_variable_metadata", ("12345",))
+    assert kwargs == {"include_summary_stats": True, "max_variables": 10, "offset": 50, "name_filter": "income"}
+
+
+def test_dataset_quality_forwards_version_and_file_cap(client, monkeypatch):
+    stub = StubService(result=_ok_result({"score": 80}))
+    monkeypatch.setattr(rest_api, "service", stub)
+    client.get("/v1/datasets/quality", params={"identifier": "doi:10.5683/SP3/EXAMPLE", "include_variable_check": True, "max_files_checked": 2})
+    _name, _args, kwargs = stub.calls[0]
+    assert kwargs == {"include_variable_check": True, "version": ":latest-published", "max_files_checked": 2}

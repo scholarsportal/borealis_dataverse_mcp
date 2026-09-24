@@ -63,15 +63,35 @@ class BorealisClient:
         *,
         params: dict[str, Any] | list[tuple[str, Any]] | None = None,
         accept: str | None = None,
+        max_bytes: int | None = None,
     ) -> tuple[str, bool]:
-        """GET/POST a non-JSON payload (e.g. DDI XML) and return the raw text."""
+        """GET/POST a non-JSON payload (e.g. DDI XML) and return the raw text.
+
+        When max_bytes is set the body is streamed and the request aborts as soon
+        as it grows past the limit, so an oversized codebook is never buffered whole.
+        """
         url = f"{self.settings.api_base_url.rstrip('/')}/{endpoint.lstrip('/')}"
         used_auth = self.settings.authentication_configured
         async with httpx.AsyncClient(timeout=self.settings.request_timeout_seconds, follow_redirects=True) as client:
-            response = await client.request(method, url, params=params, headers=self._headers(accept=accept))
+            response = await self._send_streamed(client, method, url, params, self._headers(accept=accept))
             if response.status_code == 401 and used_auth:
+                await response.aclose()
                 used_auth = False
-                response = await client.request(method, url, params=params, headers=self._headers(accept=accept, authenticated=False))
+                response = await self._send_streamed(client, method, url, params, self._headers(accept=accept, authenticated=False))
+            try:
+                return await self._read_text_response(response, url, max_bytes), used_auth
+            finally:
+                await response.aclose()
+
+    @staticmethod
+    async def _send_streamed(client: httpx.AsyncClient, method: str, url: str, params: Any, headers: dict[str, str]) -> httpx.Response:
+        request = client.build_request(method, url, params=params, headers=headers)
+        return await client.send(request, stream=True)
+
+    @staticmethod
+    async def _read_text_response(response: httpx.Response, url: str, max_bytes: int | None) -> str:
+        if response.status_code >= 400:
+            await response.aread()
             if response.status_code == 404:
                 raise BorealisNotFoundError(f"Borealis resource not found: {url}")
             if response.status_code in {401, 403}:
@@ -84,7 +104,14 @@ class BorealisClient:
                 response.raise_for_status()
             except httpx.HTTPStatusError as exc:
                 raise BorealisError(f"Borealis API returned HTTP {response.status_code}: {response.text[:500]}") from exc
-            return response.text, used_auth
+        chunks: list[bytes] = []
+        total = 0
+        async for chunk in response.aiter_bytes():
+            total += len(chunk)
+            if max_bytes is not None and total > max_bytes:
+                raise BorealisFileTooLargeError(f"Response exceeds the configured {max_bytes:,}-byte limit.")
+            chunks.append(chunk)
+        return b"".join(chunks).decode(response.encoding or "utf-8", errors="replace")
 
     async def download_limited(self, file_id: str) -> tuple[bytes, str, bool]:
         endpoint = f"access/datafile/{file_id}"
